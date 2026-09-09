@@ -8,12 +8,15 @@
   },
   "bb": {
     "name": "Plane Board",
-    "description": "A kanban board for Plane work items, against Plane Cloud or a self-hosted instance.",
+    "description": "A kanban board for Plane work items, against Plane Cloud or a self-hosted instance, with @-mentions, a CLI, and delegation to agent threads.",
     "branding": {
       "icon": "Columns2"
     },
     "server": "./server.ts",
-    "app": "./app.tsx"
+    "app": "./app.tsx",
+    "skills": [
+      "skills"
+    ]
   },
   "dependencies": {
     "@hugeicons/core-free-icons": "^4.1.3",

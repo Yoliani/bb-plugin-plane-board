@@ -22,6 +22,7 @@ import type {
 } from "./server";
 import { AccountsSettings } from "@/components/accounts-settings";
 import { Board } from "@/components/board";
+import { WorkItemDirective } from "@/components/work-item-directive";
 import { WorkItemPreview } from "@/components/work-item-preview";
 import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
@@ -41,12 +42,28 @@ interface BoardData {
   truncated: boolean;
 }
 
-/** `<account-id>/<project-id>`; a lone segment is a project, as older links used. */
-function parseSubPath(subPath: string): { accountId: string | null; projectId: string | null } {
+/**
+ * `<account-id>/<project-id>/<item-id>`; a lone segment is a project, as older
+ * links used. The optional third segment opens that item's preview, which is
+ * what a ::plane directive card links to.
+ */
+function parseSubPath(subPath: string): {
+  accountId: string | null;
+  projectId: string | null;
+  itemId: string | null;
+} {
   const segments = subPath.split("/").filter((segment) => segment !== "");
-  if (segments.length >= 2) return { accountId: segments[0], projectId: segments[1] };
-  if (segments.length === 1) return { accountId: null, projectId: segments[0] };
-  return { accountId: null, projectId: null };
+  if (segments.length >= 2) {
+    return {
+      accountId: segments[0] ?? null,
+      projectId: segments[1] ?? null,
+      itemId: segments[2] ?? null,
+    };
+  }
+  if (segments.length === 1) {
+    return { accountId: null, projectId: segments[0] ?? null, itemId: null };
+  }
+  return { accountId: null, projectId: null, itemId: null };
 }
 
 /** The account to show: the one in the URL, then the first ready one, then the first. */
@@ -121,6 +138,12 @@ function BoardPage({ subPath }: { subPath: string }) {
   }, []);
 
   const wanted = useMemo(() => parseSubPath(subPath), [subPath]);
+
+  // Read by the board-change effect below, which runs a render later than this
+  // one — after the accounts land — and must not clear an item the URL asked
+  // for. A ref, so naming an item does not re-run the board load.
+  const wantedItem = useRef<string | null>(null);
+  wantedItem.current = wanted.itemId;
   const account = useMemo(
     () => (accounts === null ? null : pickAccount(accounts, wanted.accountId)),
     [accounts, wanted.accountId],
@@ -209,10 +232,17 @@ function BoardPage({ subPath }: { subPath: string }) {
     if (loadedKey.current !== shownKey) {
       loadedKey.current = shownKey;
       setBoard(null);
-      setPreviewItemId(null);
+      setPreviewItemId(wantedItem.current);
     }
     loadBoard(false);
   }, [shownKey, loadBoard]);
+
+  // A link that names an item opens its preview. This covers navigating to
+  // another item on a board that is already loaded, which the effect above
+  // does not see: its board key has not changed.
+  useEffect(() => {
+    if (wanted.itemId !== null) setPreviewItemId(wanted.itemId);
+  }, [wanted.itemId]);
 
   // Coalesce signals: the settings form autosaves as it is typed in, and a
   // write from another window can arrive alongside one of our own.
@@ -430,6 +460,8 @@ function BoardPage({ subPath }: { subPath: string }) {
 }
 
 export default definePluginApp((app) => {
+  // `::plane{key="GA-724"}` in an assistant message renders as a live card.
+  app.slots.messageDirective({ id: "plane", component: WorkItemDirective });
   app.slots.settingsSection({
     id: "accounts",
     title: "Accounts",

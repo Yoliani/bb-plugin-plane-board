@@ -51,6 +51,20 @@ export function formatDateTime(value: string): string {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
 }
 
+/** An attachment's size, in the units Plane's own UI uses. */
+export function formatBytes(size: number | null): string {
+  if (size === null) return "";
+  if (size < 1024) return `${size} B`;
+  const units = ["KB", "MB", "GB"];
+  let value = size / 1024;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${value < 10 ? value.toFixed(1) : Math.round(value)} ${units[unit]}`;
+}
+
 export function initials(name: string): string {
   const parts = name.trim().split(/\s+/).slice(0, 2);
   return parts.map((part) => part[0]?.toUpperCase() ?? "").join("") || "?";

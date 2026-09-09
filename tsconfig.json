@@ -23,6 +23,7 @@
   "include": [
     "server.ts",
     "server.test.ts",
+    "work-items.test.ts",
     "app.tsx",
     "components",
     "lib",

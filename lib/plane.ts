@@ -72,6 +72,30 @@ export interface PlaneComment {
   isInternal: boolean;
 }
 
+/**
+ * A search hit. Plane's search endpoint answers with a narrow projection, not
+ * a work item, so this carries only what is needed to name one and fetch it.
+ */
+export interface PlaneSearchHit {
+  id: string;
+  name: string;
+  sequenceId: number;
+  projectId: string;
+  /** The project's short code, e.g. "GA" in "GA-724". */
+  projectIdentifier: string;
+}
+
+/** One file attached to a work item. */
+export interface PlaneAttachment {
+  id: string;
+  name: string;
+  /** Bytes, or null when Plane reported no size. */
+  size: number | null;
+  /** The stored MIME type, e.g. "image/png"; "" when Plane reported none. */
+  contentType: string;
+  createdAt: string | null;
+}
+
 /** A Plane error a handler can turn into a message instead of a stack trace. */
 export class PlaneError extends Error {
   constructor(
@@ -417,6 +441,165 @@ export async function listComments(
     text: toPlainText(row, "comment_html", "comment_stripped"),
     isInternal: text(row.access).toUpperCase() === "INTERNAL",
   }));
+}
+
+/** `GA-724` split into its parts, or null when it is not a work-item key. */
+export function parseWorkItemKey(
+  ref: string,
+): { identifier: string; sequenceId: number } | null {
+  const match = /^([A-Za-z][A-Za-z0-9]*)-(\d+)$/.exec(ref.trim());
+  if (match === null) return null;
+  return { identifier: match[1].toUpperCase(), sequenceId: Number(match[2]) };
+}
+
+/**
+ * Search work items across the workspace. This is the only endpoint that
+ * searches: the work-item list endpoint takes no query at all.
+ */
+export async function searchWorkItems(
+  config: PlaneConfig,
+  query: string,
+  limit: number,
+  signal?: AbortSignal,
+): Promise<PlaneSearchHit[]> {
+  const body = (await request(config, `${workspacePath(config)}/work-items/search/`, {
+    query: { search: query, limit, workspace_search: "true" },
+    signal,
+  })) as { issues?: Record<string, unknown>[] } | null;
+  return (body?.issues ?? []).map((row) => ({
+    id: text(row.id),
+    name: text(row.name),
+    sequenceId: typeof row.sequence_id === "number" ? row.sequence_id : 0,
+    projectId: text(row.project_id),
+    projectIdentifier: text(row.project__identifier),
+  }));
+}
+
+/**
+ * Resolve `GA-724` to the work item it names. Search matches the key loosely —
+ * searching "GA-1" also returns GAMI-1, and a key can match another item's
+ * title — so the hits are filtered on the identifier and sequence themselves.
+ */
+export async function findWorkItemByKey(
+  config: PlaneConfig,
+  key: string,
+  signal?: AbortSignal,
+): Promise<PlaneSearchHit | null> {
+  const parsed = parseWorkItemKey(key);
+  if (parsed === null) return null;
+  const hits = await searchWorkItems(config, key, 20, signal);
+  return (
+    hits.find(
+      (hit) =>
+        hit.projectIdentifier.toUpperCase() === parsed.identifier &&
+        hit.sequenceId === parsed.sequenceId,
+    ) ?? null
+  );
+}
+
+/** Post a comment. Plane stores comments as HTML, so the text is escaped in. */
+export async function createComment(
+  config: PlaneConfig,
+  projectId: string,
+  workItemId: string,
+  body: string,
+  signal?: AbortSignal,
+): Promise<PlaneComment> {
+  const row = (await request(
+    config,
+    `${projectPath(config, projectId)}/work-items/${encodeURIComponent(workItemId)}/comments/`,
+    { method: "POST", body: { comment_html: textToHtml(body) }, signal },
+  )) as Record<string, unknown>;
+  return {
+    id: text(row.id),
+    actorId: nullableText(row.actor),
+    createdAt: nullableText(row.created_at),
+    text: toPlainText(row, "comment_html", "comment_stripped"),
+    isInternal: text(row.access).toUpperCase() === "INTERNAL",
+  };
+}
+
+/** Plain text as the paragraph HTML Plane's editor expects. */
+export function textToHtml(value: string): string {
+  const escape = (line: string) =>
+    line
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+  return value
+    .split(/\n{2,}/)
+    .map((block) => `<p>${escape(block).replace(/\n/g, "<br />")}</p>`)
+    .join("");
+}
+
+/**
+ * The path a work item's attachments live under. Note the `/issues/` segment:
+ * attachments were never renamed the way the work-item endpoints were, and
+ * `/work-items/<id>/issue-attachments/` answers 404.
+ */
+function attachmentsPath(
+  config: PlaneConfig,
+  projectId: string,
+  workItemId: string,
+): string {
+  return `${projectPath(config, projectId)}/issues/${encodeURIComponent(workItemId)}/issue-attachments/`;
+}
+
+export async function listAttachments(
+  config: PlaneConfig,
+  projectId: string,
+  workItemId: string,
+  signal?: AbortSignal,
+): Promise<PlaneAttachment[]> {
+  const rows = await paginate(config, attachmentsPath(config, projectId, workItemId), {
+    limit: 100,
+    signal,
+  });
+  return rows.map((row) => {
+    const attributes = (row.attributes ?? {}) as Record<string, unknown>;
+    const size =
+      typeof attributes.size === "number"
+        ? attributes.size
+        : typeof row.size === "number"
+          ? row.size
+          : null;
+    return {
+      id: text(row.id),
+      name: text(attributes.name) || text(row.id),
+      size,
+      contentType: text(attributes.type),
+      createdAt: nullableText(row.created_at),
+    };
+  });
+}
+
+/**
+ * The attachment's bytes. Plane answers the detail endpoint with the file
+ * itself (via a redirect to storage), so the response is returned unread for
+ * the caller to stream.
+ */
+export async function fetchAttachment(
+  config: PlaneConfig,
+  projectId: string,
+  workItemId: string,
+  attachmentId: string,
+  signal?: AbortSignal,
+): Promise<Response> {
+  const url = `${config.rootUrl}/api/v1${attachmentsPath(config, projectId, workItemId)}${encodeURIComponent(attachmentId)}/`;
+  let response: Response;
+  try {
+    response = await fetch(url, { headers: { "X-API-Key": config.apiKey }, signal });
+  } catch (cause) {
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    throw new PlaneError(`Could not reach ${config.rootUrl}: ${detail}`, 0);
+  }
+  if (!response.ok) {
+    throw new PlaneError(
+      `Plane returned ${response.status} for the attachment.`,
+      response.status,
+    );
+  }
+  return response;
 }
 
 export async function updateWorkItem(

@@ -1,9 +1,10 @@
 // The work-item preview: Plane's peek view, as a BB dialog (a drawer on a
-// compact viewport). Opening a card fetches the description and comments,
-// which the board's list request does not carry.
+// compact viewport). Opening a card fetches the description, attachments and
+// comments, which the board's list request does not carry.
 import { useEffect, useState } from "react";
 import { UrlLink, useRpc } from "@get-bb/plugin-sdk/app";
 import type {
+  BoardAttachment,
   BoardComment,
   BoardLabel,
   BoardMember,
@@ -11,6 +12,7 @@ import type {
   BoardWorkItem,
   rpcContract,
 } from "@/server";
+import { DelegateWorkItem } from "@/components/delegate-work-item";
 import {
   Dialog,
   DialogContent,
@@ -20,6 +22,7 @@ import {
 import { Icon } from "@/components/ui/icon";
 import {
   dotStyle,
+  formatBytes,
   formatDate,
   formatDateTime,
   initials,
@@ -33,6 +36,8 @@ interface Detail {
   description: string;
   comments: BoardComment[];
   commentsAvailable: boolean;
+  attachments: BoardAttachment[];
+  attachmentsAvailable: boolean;
 }
 
 /** One label of the properties table: a fixed, quiet left column. */
@@ -71,6 +76,47 @@ export function Avatar({ name }: { name: string }) {
     >
       {initials(name)}
     </span>
+  );
+}
+
+/**
+ * One attached file. The url points at this plugin's own route rather than at
+ * Plane: the browser has no API key, so it cannot fetch the asset directly.
+ * Images show themselves; anything else is a named row that downloads.
+ */
+function Attachment({ attachment }: { attachment: BoardAttachment }) {
+  const size = formatBytes(attachment.size);
+  if (attachment.contentType.startsWith("image/")) {
+    return (
+      <a
+        href={attachment.url}
+        target="_blank"
+        rel="noreferrer"
+        title={size === "" ? attachment.name : `${attachment.name} — ${size}`}
+        className="block overflow-hidden rounded border border-border hover:border-foreground/40"
+      >
+        <img
+          src={attachment.url}
+          alt={attachment.name}
+          loading="lazy"
+          className="h-24 w-full bg-muted object-cover"
+        />
+      </a>
+    );
+  }
+  return (
+    <a
+      href={attachment.url}
+      target="_blank"
+      rel="noreferrer"
+      className="flex items-center gap-2 rounded border border-border px-2 py-1.5 text-sm hover:border-foreground/40"
+    >
+      <Icon name="FileAttachment" className="size-4 shrink-0 text-muted-foreground" />
+      <span className="min-w-0 flex-1 truncate">{attachment.name}</span>
+      {size === "" ? null : (
+        <span className="shrink-0 text-xs text-muted-foreground">{size}</span>
+      )}
+    </a>
   );
 }
 
@@ -258,6 +304,36 @@ export function WorkItemPreview({
               </p>
             )}
           </div>
+
+          <div className="py-3">
+            <h3 className="text-xs font-medium text-muted-foreground">
+              Attachments
+              {detail === null || !detail.attachmentsAvailable
+                ? ""
+                : ` (${detail.attachments.length})`}
+            </h3>
+            {detail === null ? (
+              <p className="mt-1.5 text-sm text-muted-foreground">Loading…</p>
+            ) : !detail.attachmentsAvailable ? (
+              <p className="mt-1.5 text-sm text-muted-foreground">
+                This API key cannot read attachments.
+              </p>
+            ) : detail.attachments.length === 0 ? (
+              <p className="mt-1.5 text-sm text-muted-foreground">No attachments.</p>
+            ) : (
+              <div className="mt-1.5 grid grid-cols-[repeat(auto-fill,minmax(9rem,1fr))] gap-2">
+                {detail.attachments.map((attachment) => (
+                  <Attachment key={attachment.id} attachment={attachment} />
+                ))}
+              </div>
+            )}
+          </div>
+
+          <DelegateWorkItem
+            accountId={accountId}
+            projectId={projectId}
+            itemId={item.id}
+          />
 
           <div className="pt-3">
             <h3 className="text-xs font-medium text-muted-foreground">
