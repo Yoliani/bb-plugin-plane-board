@@ -4,7 +4,18 @@
 // backend's RPC contract, so an API key stays on the server. The selected
 // account and project live in the panel's subPath, which makes a board a
 // shareable link (/plugins/plane-board/plane/<account-id>/<project-id>).
+//
+// Board data is cached with TanStack Query, keyed by account identity + project,
+// so switching between projects (or returning to one) shows the last loaded
+// board immediately instead of a blank column while the fresh fetch lands.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  QueryClient,
+  QueryClientProvider,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import {
   definePluginApp,
   useBbNavigate,
@@ -26,12 +37,22 @@ import { WorkItemDirective } from "@/components/work-item-directive";
 import { WorkItemPreview } from "@/components/work-item-preview";
 import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
+import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
 
 const PANEL_PATH = "plane";
 
 /** A board refetch waits this long for more signals, so a burst is one load. */
 const REFETCH_DEBOUNCE_MS = 250;
+
+/** How long a loaded board stays fresh before the next visit refetches it. */
+const BOARD_STALE_MS = 60 * 1000;
+
+/** How long a cached board survives with no live consumer. */
+const BOARD_GC_MS = 30 * 60 * 1000;
+
+/** Module-scoped so the cache survives the panel re-mounting between visits. */
+export const queryClient = new QueryClient();
 
 interface BoardData {
   project: BoardProject;
@@ -121,17 +142,25 @@ function Notice({
   );
 }
 
-function BoardPage({ subPath }: { subPath: string }) {
+export function BoardPage({ subPath }: { subPath: string }) {
+  return (
+    <QueryClientProvider client={queryClient}>
+      <BoardPageContent subPath={subPath} />
+    </QueryClientProvider>
+  );
+}
+
+function BoardPageContent({ subPath }: { subPath: string }) {
   const rpc = useRpc<typeof rpcContract>();
   const navigate = useBbNavigate();
+  const queryClient = useQueryClient();
 
   const [accounts, setAccounts] = useState<BoardAccount[] | null>(null);
   const [projects, setProjects] = useState<BoardProject[] | null>(null);
-  const [board, setBoard] = useState<BoardData | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [isRefreshing, setIsRefreshing] = useState(false);
   const [movingItemId, setMovingItemId] = useState<string | null>(null);
   const [previewItemId, setPreviewItemId] = useState<string | null>(null);
+  const [searchQuery, setSearchQuery] = useState("");
 
   const report = useCallback((cause: unknown) => {
     setError(cause instanceof Error ? cause.message : String(cause));
@@ -159,6 +188,43 @@ function BoardPage({ subPath }: { subPath: string }) {
     [projects, wanted.projectId, account?.defaultProject],
   );
   const projectId = project?.id ?? null;
+
+  // The board query key: account identity plus project. Including the server,
+  // workspace and web URLs means a config change that moves this connection to
+  // a different Plane side can never reuse a stale board for the old one.
+  const boardQueryKey = useMemo<
+    ["plane-board", "board", ...string[]] | null
+  >(() => {
+    if (account === null || projectId === null) return null;
+    return [
+      "plane-board",
+      "board",
+      account.id,
+      account.serverUrl,
+      account.workspace,
+      account.webUrl,
+      projectId,
+    ];
+  }, [account, projectId]);
+
+  // Latest key for the realtime handlers, which fire outside render.
+  const boardQueryKeyRef = useRef<typeof boardQueryKey>(null);
+  boardQueryKeyRef.current = boardQueryKey;
+
+  const board = useQuery({
+    queryKey: boardQueryKey ?? ["plane-board", "board", "none"],
+    queryFn: () => {
+      if (accountId === null || projectId === null) {
+        throw new Error("Select an account and a project first.");
+      }
+      return rpc.call("board_load", { accountId, projectId });
+    },
+    enabled: accountReady && accountId !== null && projectId !== null,
+    staleTime: BOARD_STALE_MS,
+    gcTime: BOARD_GC_MS,
+    retry: 1,
+    refetchOnWindowFocus: false,
+  });
 
   const loadConfig = useCallback(() => {
     rpc.call("accounts_list").then((result) => {
@@ -197,52 +263,27 @@ function BoardPage({ subPath }: { subPath: string }) {
     };
   }, [rpc, accountId, accountReady, report]);
 
-  // Only the newest board request may write state. Without this, two overlapping
-  // loads can land out of order and the board visibly swaps twice.
-  const requestSeq = useRef(0);
+  // A link that names an item opens its preview. This covers navigating to
+  // another item on a board that is already loaded, which the effect below
+  // does not see: its board key has not changed.
+  useEffect(() => {
+    if (wanted.itemId !== null) setPreviewItemId(wanted.itemId);
+  }, [wanted.itemId]);
 
-  const loadBoard = useCallback(
-    (showSpinner: boolean) => {
-      if (accountId === null || projectId === null) return;
-      const seq = ++requestSeq.current;
-      if (showSpinner) setIsRefreshing(true);
-      rpc.call("board_load", { accountId, projectId }).then(
-        (data) => {
-          if (seq !== requestSeq.current) return;
-          setBoard(data);
-          setError(null);
-          setIsRefreshing(false);
-        },
-        (cause) => {
-          if (seq !== requestSeq.current) return;
-          report(cause);
-          setIsRefreshing(false);
-        },
-      );
-    },
-    [rpc, accountId, projectId, report],
-  );
-
-  // Clear the board only when the board being shown actually changes, so a
-  // refetch updates in place instead of blanking the columns.
-  const shownKey = accountId === null || projectId === null ? null : `${accountId}/${projectId}`;
+  // Open the URL-named item (or clear the preview) when the board that is
+  // actually shown changes. Runs a render after the one that decides the
+  // account and project, so it reads `wantedItem` from there.
+  const shownKey =
+    accountId === null || projectId === null ? null : `${accountId}/${projectId}`;
   const loadedKey = useRef<string | null>(null);
   useEffect(() => {
     if (shownKey === null) return;
     if (loadedKey.current !== shownKey) {
       loadedKey.current = shownKey;
-      setBoard(null);
       setPreviewItemId(wantedItem.current);
+      setSearchQuery("");
     }
-    loadBoard(false);
-  }, [shownKey, loadBoard]);
-
-  // A link that names an item opens its preview. This covers navigating to
-  // another item on a board that is already loaded, which the effect above
-  // does not see: its board key has not changed.
-  useEffect(() => {
-    if (wanted.itemId !== null) setPreviewItemId(wanted.itemId);
-  }, [wanted.itemId]);
+  }, [shownKey]);
 
   // Coalesce signals: the settings form autosaves as it is typed in, and a
   // write from another window can arrive alongside one of our own.
@@ -261,57 +302,104 @@ function BoardPage({ subPath }: { subPath: string }) {
     [],
   );
 
-  // server.ts publishes after every write, so a move made in another window (or
-  // by an agent) lands here too.
+  // server.ts publishes after every write, so a change on this board that came
+  // from another window (or an agent) lands here too. Only refetch when the
+  // change is for the project we are showing.
   useRealtime("board-changed", (payload) => {
     const changed = (payload as { projectId?: string | null }).projectId ?? null;
-    if (changed === null || changed === projectId) scheduleRefetch(() => loadBoard(false));
+    if (changed === null || changed === projectId) {
+      scheduleRefetch(() => {
+        const key = boardQueryKeyRef.current;
+        if (key !== null) queryClient.invalidateQueries({ queryKey: key, exact: true });
+      });
+    }
   });
 
-  // A connection changed. Re-read the accounts; the board reloads only if the
-  // account or project it is showing actually moved.
+  // A connection changed. Re-read the accounts and drop every cached board —
+  // identity is in the query key, so a moved server/workspace needs a reload
+  // rather than serving a board from the old connection.
   useRealtime("config-changed", () => {
-    scheduleRefetch(loadConfig);
+    scheduleRefetch(() => {
+      loadConfig();
+      queryClient.invalidateQueries({ queryKey: ["plane-board", "board"], exact: false });
+    });
   });
 
-  const move = (itemId: string, stateId: string) => {
-    if (board === null || accountId === null || projectId === null) return;
-    const current = board.items.find((item) => item.id === itemId);
-    if (current === undefined || current.stateId === stateId) return;
-    const previous = board.items;
-    setMovingItemId(itemId);
-    setBoard({
-      ...board,
-      items: previous.map((item) => (item.id === itemId ? { ...item, stateId } : item)),
-    });
-    rpc.call("item_move", { accountId, projectId, itemId, stateId }).then(
-      (updated) => {
-        setMovingItemId(null);
-        setError(null);
-        setBoard((live) =>
-          live === null
-            ? live
+  const move = useMutation({
+    mutationFn: ({ itemId, stateId }: { itemId: string; stateId: string }) => {
+      if (accountId === null || projectId === null) {
+        return Promise.reject(new Error("Select an account and a project first."));
+      }
+      return rpc.call("item_move", { accountId, projectId, itemId, stateId });
+    },
+    onMutate: async ({ itemId, stateId }) => {
+      const key = boardQueryKeyRef.current;
+      if (key === null) return { previous: undefined, key };
+      await queryClient.cancelQueries({ queryKey: key });
+      const previous = queryClient.getQueryData<BoardData>(key);
+      setMovingItemId(itemId);
+      queryClient.setQueryData<BoardData>(key, (old) =>
+        old === undefined
+          ? old
+          : {
+              ...old,
+              items: old.items.map((item) =>
+                item.id === itemId ? { ...item, stateId } : item,
+              ),
+            },
+      );
+      return { previous, key };
+    },
+    onError: (_cause, _vars, context) => {
+      if (context?.previous !== undefined && context.key !== null) {
+        queryClient.setQueryData(context.key, context.previous);
+      }
+    },
+    onSuccess: (updated, _vars, context) => {
+      if (context !== undefined && context.key !== null) {
+        queryClient.setQueryData<BoardData>(context.key, (old) =>
+          old === undefined
+            ? old
             : {
-                ...live,
-                items: live.items.map((item) => (item.id === itemId ? updated : item)),
+                ...old,
+                items: old.items.map((item) =>
+                  item.id === updated.id ? updated : item,
+                ),
               },
         );
-      },
-      (cause) => {
-        setMovingItemId(null);
-        report(cause);
-        setBoard((live) => (live === null ? live : { ...live, items: previous }));
-      },
-    );
-  };
+      }
+    },
+    onSettled: (_data, cause, _vars, context) => {
+      setMovingItemId(null);
+      if (cause !== null) setError(cause instanceof Error ? cause.message : String(cause));
+      if (context !== undefined && context.key !== null) {
+        queryClient.invalidateQueries({ queryKey: context.key, exact: true });
+      }
+    },
+  });
 
-  const create = (stateId: string, name: string) => {
-    if (accountId === null || projectId === null) return;
-    rpc.call("item_create", { accountId, projectId, stateId, name }).then((item) => {
-      setError(null);
-      setBoard((live) => (live === null ? live : { ...live, items: [item, ...live.items] }));
-    }, report);
-  };
+  const create = useMutation({
+    mutationFn: ({ stateId, name }: { stateId: string; name: string }) => {
+      if (accountId === null || projectId === null) {
+        return Promise.reject(new Error("Select an account and a project first."));
+      }
+      return rpc.call("item_create", { accountId, projectId, stateId, name });
+    },
+    onMutate: () => ({ key: boardQueryKeyRef.current }),
+    onSuccess: (updated, _vars, context) => {
+      if (context !== undefined && context.key !== null) {
+        queryClient.setQueryData<BoardData>(context.key, (old) =>
+          old === undefined ? old : { ...old, items: [updated, ...old.items] },
+        );
+      }
+    },
+    onSettled: (_data, cause, _vars, context) => {
+      if (cause !== null) setError(cause instanceof Error ? cause.message : String(cause));
+      if (context !== undefined && context.key !== null) {
+        queryClient.invalidateQueries({ queryKey: context.key, exact: true });
+      }
+    },
+  });
 
   const goTo = (nextAccountId: string, nextProjectId: string) =>
     navigate.toPluginPanel(PANEL_PATH, {
@@ -320,24 +408,35 @@ function BoardPage({ subPath }: { subPath: string }) {
     });
 
   const statesById = useMemo(
-    () => new Map((board?.states ?? []).map((state) => [state.id, state])),
-    [board],
+    () => new Map((board.data?.states ?? []).map((state) => [state.id, state])),
+    [board.data],
   );
   const labelsById = useMemo(
-    () => new Map((board?.labels ?? []).map((label) => [label.id, label])),
-    [board],
+    () => new Map((board.data?.labels ?? []).map((label) => [label.id, label])),
+    [board.data],
   );
   const membersById = useMemo(
-    () => new Map((board?.members ?? []).map((member) => [member.id, member])),
-    [board],
+    () => new Map((board.data?.members ?? []).map((member) => [member.id, member])),
+    [board.data],
   );
+
+  const identifier = board.data?.project.identifier ?? "";
+  const isSearching = searchQuery.trim() !== "";
+  const filteredItems = useMemo(() => {
+    const query = searchQuery.trim().toLowerCase();
+    if (query === "") return board.data?.items ?? [];
+    return (board.data?.items ?? []).filter((item) => {
+      if (item.name.toLowerCase().includes(query)) return true;
+      return `${identifier}-${item.sequenceId}`.toLowerCase().includes(query);
+    });
+  }, [board.data, searchQuery, identifier]);
 
   // The preview reads the live card, so a move or a refetch updates it in
   // place; an item that leaves the board closes it.
   const previewItem =
     previewItemId === null
       ? null
-      : (board?.items.find((item) => item.id === previewItemId) ?? null);
+      : (board.data?.items.find((item) => item.id === previewItemId) ?? null);
 
   // Render nothing until the accounts are known. Guessing produces a flash of
   // board chrome that is then replaced by the setup notice, or the reverse.
@@ -392,23 +491,38 @@ function BoardPage({ subPath }: { subPath: string }) {
             </option>
           ))}
         </select>
-        {board === null ? null : (
+        <Input
+          aria-label="Search work items"
+          placeholder="Search…"
+          value={searchQuery}
+          onChange={(event) => setSearchQuery(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Escape") {
+              event.preventDefault();
+              setSearchQuery("");
+            }
+          }}
+          className="ml-auto h-8 w-full max-w-56"
+        />
+        {board.data === undefined ? null : (
           <span className="text-xs text-muted-foreground">
-            {board.items.length} work item{board.items.length === 1 ? "" : "s"}
-            {board.truncated ? " (most recently updated)" : ""}
+            {isSearching
+              ? `${filteredItems.length} of ${board.data.items.length} work item${board.data.items.length === 1 ? "" : "s"}`
+              : `${board.data.items.length} work item${board.data.items.length === 1 ? "" : "s"}`}
+            {board.data.truncated ? " (most recently updated)" : ""}
           </span>
         )}
         <Button
           variant="ghost"
           size="icon"
-          className="ml-auto size-7 text-muted-foreground hover:text-foreground"
+          className="size-7 text-muted-foreground hover:text-foreground"
           aria-label="Refresh board"
-          disabled={projectId === null || isRefreshing}
-          onClick={() => loadBoard(true)}
+          disabled={projectId === null || board.isFetching}
+          onClick={() => board.refetch()}
         >
           <Icon
             name="ArrowReloadHorizontal"
-            className={cn("size-4", isRefreshing && "animate-spin")}
+            className={cn("size-4", board.isFetching && "animate-spin")}
           />
         </Button>
       </div>
@@ -423,19 +537,26 @@ function BoardPage({ subPath }: { subPath: string }) {
         <Notice>
           <strong>{account.label}</strong> has no API key or workspace slug yet.
         </Notice>
-      ) : board !== null ? (
-        <Board
-          states={board.states}
-          items={board.items}
-          identifier={board.project.identifier}
-          labels={labelsById}
-          members={membersById}
-          movingItemId={movingItemId}
-          onMove={move}
-          onCreate={create}
-          onOpenItem={(item) => setPreviewItemId(item.id)}
-        />
-      ) : error !== null ? null : (
+      ) : board.data !== undefined ? (
+        isSearching && filteredItems.length === 0 ? (
+          <Notice>No work items match “{searchQuery.trim()}”.</Notice>
+        ) : (
+          <Board
+            states={board.data.states}
+            items={filteredItems}
+            identifier={board.data.project.identifier}
+            labels={labelsById}
+            members={membersById}
+            movingItemId={movingItemId}
+            filtering={isSearching}
+            onMove={(itemId, stateId) => move.mutate({ itemId, stateId })}
+            onCreate={(stateId, name) => create.mutate({ stateId, name })}
+            onOpenItem={(item) => setPreviewItemId(item.id)}
+          />
+        )
+      ) : board.error !== null ? (
+        <Notice tone="error">{board.error.message}</Notice>
+      ) : (
         <Notice>
           {projects !== null && projects.length === 0
             ? "This workspace has no projects yet."
@@ -443,11 +564,11 @@ function BoardPage({ subPath }: { subPath: string }) {
         </Notice>
       )}
 
-      {board !== null && previewItem !== null && accountId !== null ? (
+      {board.data !== undefined && previewItem !== null && accountId !== null ? (
         <WorkItemPreview
           accountId={accountId}
-          projectId={board.project.id}
-          identifier={board.project.identifier}
+          projectId={board.data.project.id}
+          identifier={board.data.project.identifier}
           item={previewItem}
           states={statesById}
           labels={labelsById}

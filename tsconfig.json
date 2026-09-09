@@ -24,6 +24,7 @@
     "server.ts",
     "server.test.ts",
     "work-items.test.ts",
+    "app.test.tsx",
     "app.tsx",
     "components",
     "lib",

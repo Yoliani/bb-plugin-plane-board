@@ -160,6 +160,7 @@ function Column({
   members,
   movingItemId,
   isAdding,
+  filtering,
   onStartAdd,
   onCancelAdd,
   onCreate,
@@ -173,6 +174,7 @@ function Column({
   members: Map<string, BoardMember>;
   movingItemId: string | null;
   isAdding: boolean;
+  filtering: boolean;
   onStartAdd: () => void;
   onCancelAdd: () => void;
   onCreate: (name: string) => void;
@@ -237,7 +239,7 @@ function Column({
             }}
           />
         ))}
-        {items.length === 0 && !isAdding ? (
+        {items.length === 0 && !isAdding && !filtering ? (
           <p className="px-2 py-4 text-center text-xs text-muted-foreground">
             Drop a work item here
           </p>
@@ -257,6 +259,7 @@ export function Board({
   onMove,
   onCreate,
   onOpenItem,
+  filtering = false,
 }: {
   states: BoardState[];
   items: BoardWorkItem[];
@@ -267,6 +270,8 @@ export function Board({
   onMove: (itemId: string, stateId: string) => void;
   onCreate: (stateId: string, name: string) => void;
   onOpenItem: (item: BoardWorkItem) => void;
+  /** True while the user is filtering cards with the search box. */
+  filtering?: boolean;
 }) {
   const [addingStateId, setAddingStateId] = useState<string | null>(null);
 
@@ -288,6 +293,7 @@ export function Board({
             members={members}
             movingItemId={movingItemId}
             isAdding={addingStateId === state.id}
+            filtering={filtering}
             onStartAdd={() => setAddingStateId(state.id)}
             onCancelAdd={() => setAddingStateId(null)}
             onCreate={(name) => {
