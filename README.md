@@ -26,52 +26,33 @@ instance.
 
 ## Setup
 
-One install can hold several Plane connections. Under
-**Extensions → Plugins → Plane Board**:
+Open **Extensions → Plugins → Plane Board** and use the **Accounts** panel:
 
-1. Put the connections in **Accounts**, a JSON array:
+1. Click **Add account**.
+2. Fill in a name, your workspace slug (the first path segment in your Plane
+   URL, `https://app.plane.so/<workspace>/`), the server URL — leave it at
+   `https://api.plane.so` for Plane Cloud, or point it at your own instance —
+   and an API key from Plane → Profile settings → Personal access tokens.
+   Default project and Web UI URL are optional.
+3. Save. The panel tests the connection straight away and reports what Plane
+   said.
 
-   ```json
-   [
-     {
-       "id": "work",
-       "label": "Work",
-       "serverUrl": "https://plane.example.com",
-       "workspace": "acme",
-       "webUrl": "",
-       "defaultProject": "WEB"
-     },
-     {
-       "id": "cloud",
-       "label": "Plane Cloud",
-       "serverUrl": "https://api.plane.so",
-       "workspace": "my-workspace",
-       "webUrl": "",
-       "defaultProject": ""
-     }
-   ]
-   ```
-
-   `id` is lowercase letters, digits, or `_`, and names the account's API key
-   field. `workspace` is the first path segment in the Plane UI URL,
-   `https://app.plane.so/<workspace>/`. `webUrl` is only needed when the UI is
-   not served from `serverUrl`. `defaultProject` takes an identifier (`WEB`), a
-   name, or a UUID.
-
-2. **Reload the plugin** (`bb plugin reload plane-board`). Settings descriptors
-   are fixed for the life of a load, so a new account's key field only appears
-   on the next one.
-
-3. Fill in the **API key — &lt;label&gt;** field for each account (Plane →
-   Profile settings → Personal access tokens). Keys are `secret` settings: they
-   live in the 0600 secrets file, never in the database, and are never sent to
-   the browser.
+Add up to five connections and switch between them from the picker in the
+board's header. Editing one leaves its stored key alone unless you type a new
+one. Removing one also erases its key.
 
 `maxItems` (how many of the most recently updated work items to fetch, default
 200) is shared by every account.
 
-The board's header shows an account picker once more than one is configured,
-and the selected account and project both live in the URL.
+### Where the pieces live
+
+The editable half of an account is in this plugin's kv storage, written only
+through the panel. The API key is a `secret` setting, so it stays in the 0600
+secrets file and is never put in the database or sent to the browser. Secret
+settings have to be declared when the plugin loads and cannot be created on
+demand, so the plugin declares a fixed pool of five key slots up front and each
+account claims one — which is why five is the ceiling, and why the settings form
+lists slots by the account holding them.
 
 ### Checking a connection
 
@@ -82,14 +63,19 @@ bb plane-board projects [--account <id>]  # that account's projects
 ```
 
 `--account` defaults to the first connection that has both a workspace and a
-key.
+key. Accounts are added and edited in the panel, not from the CLI.
 
-### Upgrading from the single-account version
+## Tests
 
-The old `workspace` / `serverUrl` / `webUrl` / `defaultProject` fields are
-migrated into an account with id `default` on first load, and then left empty
-(they are removed in a later version). That account's key keeps the plain
-`apiKey` name, so a configured key survives the upgrade untouched.
+```
+npm test
+```
+
+`server.test.ts` drives the backend through the SDK's fake plugin host — account
+creation, key-slot claiming and release, the edit that keeps a stored key, and
+the migration off the old settings. `components/accounts-settings.test.tsx`
+mounts the Accounts panel with `renderSlot` and drives it the way a person does:
+click **Add account**, fill the form, save, confirm a removal.
 
 ## Notes on Plane's payloads
 

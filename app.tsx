@@ -20,6 +20,7 @@ import type {
   BoardWorkItem,
   rpcContract,
 } from "./server";
+import { AccountsSettings } from "@/components/accounts-settings";
 import { Board } from "@/components/board";
 import { WorkItemPreview } from "@/components/work-item-preview";
 import { Button } from "@/components/ui/button";
@@ -108,7 +109,6 @@ function BoardPage({ subPath }: { subPath: string }) {
   const navigate = useBbNavigate();
 
   const [accounts, setAccounts] = useState<BoardAccount[] | null>(null);
-  const [configError, setConfigError] = useState<string | null>(null);
   const [projects, setProjects] = useState<BoardProject[] | null>(null);
   const [board, setBoard] = useState<BoardData | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -138,9 +138,8 @@ function BoardPage({ subPath }: { subPath: string }) {
   const projectId = project?.id ?? null;
 
   const loadConfig = useCallback(() => {
-    rpc.call("config_read").then((config) => {
-      setAccounts(config.accounts);
-      setConfigError(config.error);
+    rpc.call("accounts_list").then((result) => {
+      setAccounts(result.accounts);
     }, report);
   }, [rpc, report]);
 
@@ -314,29 +313,17 @@ function BoardPage({ subPath }: { subPath: string }) {
   // board chrome that is then replaced by the setup notice, or the reverse.
   if (accounts === null) return null;
 
-  if (configError !== null) {
-    return (
-      <div className="pt-3 md:pt-4">
-        <Notice tone="error">{configError}</Notice>
-      </div>
-    );
-  }
-
   if (account === null || !accounts.some((candidate) => candidate.ready)) {
     return (
       <div className="h-full min-h-0 overflow-y-auto pt-3 md:pt-4">
         <Notice>
           <p className="text-foreground">Connect a Plane workspace to see a board.</p>
           <p className="mt-2">
-            Open <strong>Extensions → Plugins → Plane Board</strong>, put your workspace
-            slug and server URL in <strong>Accounts</strong>, and fill in the matching{" "}
-            <strong>API key</strong> field (Plane → Profile settings → Personal access
-            tokens). Leave the server URL at <code>https://api.plane.so</code> for Plane
-            Cloud, or point it at your self-hosted instance.
-          </p>
-          <p className="mt-2">
-            Adding a second account? Save it in <strong>Accounts</strong>, then run{" "}
-            <code>bb plugin reload plane-board</code> so its own API key field appears.
+            Open <strong>Extensions → Plugins → Plane Board</strong> and use{" "}
+            <strong>Add account</strong> in the Accounts panel. You need a workspace slug
+            and an API key (Plane → Profile settings → Personal access tokens). Leave the
+            server URL at <code>https://api.plane.so</code> for Plane Cloud, or point it
+            at your self-hosted instance.
           </p>
         </Notice>
       </div>
@@ -443,6 +430,13 @@ function BoardPage({ subPath }: { subPath: string }) {
 }
 
 export default definePluginApp((app) => {
+  app.slots.settingsSection({
+    id: "accounts",
+    title: "Accounts",
+    description:
+      "The Plane workspaces this board can show. Each one keeps its API key as a secret on the server.",
+    component: AccountsSettings,
+  });
   app.slots.navPanel({
     id: "plane-board",
     title: "Plane",

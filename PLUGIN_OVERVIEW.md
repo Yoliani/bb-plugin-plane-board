@@ -15,9 +15,10 @@ See your Plane board next to the work it tracks, without leaving BB.
 
 ## Plane Cloud, your own instance, or several at once
 
-Configure as many connections as you like — a Cloud account and a self-hosted
-instance side by side — and switch between them from the board's header. Point
-each one at `https://api.plane.so` or at the root of your own instance.
+Click **Add account** in the plugin's Accounts panel, fill in a workspace and
+an API key, and it tests the connection for you. Keep up to five side by side —
+a Cloud account and a self-hosted instance, say — and switch between them from
+the picker in the board's header.
 
 Authentication is a personal access token from Plane's profile settings. Each
 account's key is stored as a secret on the BB server: the browser never sees a

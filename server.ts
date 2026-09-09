@@ -5,11 +5,20 @@
 // RPC contract below; `bb plane-board` reaches the same helpers from a shell.
 //
 // One install can hold several Plane connections — a Cloud account and a
-// self-hosted instance, say. The non-secret half of each lives in the
-// `accounts` JSON setting; the key half is one `secret` setting per account,
-// so keys stay in the 0600 secrets file rather than the database.
+// self-hosted instance, say. They are edited in the Accounts panel on the
+// plugin's settings page, stored in this plugin's kv, and their API keys are
+// held in `secret` settings so they stay in the 0600 secrets file. Because
+// secret settings are declared once per load, keys live in a fixed pool of
+// slots that accounts claim (see lib/accounts.ts).
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
+import {
+  KEY_SLOTS,
+  MAX_ACCOUNTS,
+  freeKeySlot,
+  uniqueId,
+  type StoredAccount,
+} from "./lib/accounts";
 import {
   createWorkItem,
   getProject,
@@ -30,45 +39,7 @@ import {
   type PlaneState,
 } from "./lib/plane";
 
-/** The account every install starts with; its key keeps the plain `apiKey` name. */
-const DEFAULT_ACCOUNT_ID = "default";
-
-/**
- * One connection's non-secret half. Ids are restricted because each one becomes
- * a settings key.
- */
-const accountSchema = z
-  .object({
-    id: z
-      .string()
-      .regex(/^[a-z0-9][a-z0-9_]{0,31}$/, "id must be lowercase letters, digits, or _"),
-    label: z.string().trim().min(1).max(64),
-    serverUrl: z.string().trim().default("https://api.plane.so"),
-    workspace: z.string().trim().default(""),
-    webUrl: z.string().trim().default(""),
-    defaultProject: z.string().trim().default(""),
-  })
-  .strict();
-
-type Account = z.infer<typeof accountSchema>;
-
-const accountsSchema = z.array(accountSchema).max(20);
-
-function parseAccounts(raw: string): Account[] {
-  const parsed = accountsSchema.safeParse(JSON.parse(raw));
-  if (!parsed.success) throw new Error(parsed.error.issues[0]?.message ?? "invalid accounts");
-  const ids = new Set<string>();
-  for (const account of parsed.data) {
-    if (ids.has(account.id)) throw new Error(`duplicate account id '${account.id}'`);
-    ids.add(account.id);
-  }
-  return parsed.data;
-}
-
-/** The settings key holding an account's API key. */
-function keySettingName(accountId: string): string {
-  return accountId === DEFAULT_ACCOUNT_ID ? "apiKey" : `apiKey_${accountId}`;
-}
+const ACCOUNTS_KEY = "accounts";
 
 const projectSchema = z.object({
   id: z.string(),
@@ -115,16 +86,33 @@ const commentSchema = z.object({
   isInternal: z.boolean(),
 });
 
-/** One connection as the board sees it — never carrying the key itself. */
+/** One connection as the frontend sees it — never carrying the key itself. */
 const accountInfoSchema = z.object({
   id: z.string(),
   label: z.string(),
+  serverUrl: z.string(),
   workspace: z.string(),
-  rootUrl: z.string(),
+  webUrl: z.string(),
   defaultProject: z.string(),
-  /** False when the account has no API key yet, or no workspace slug. */
+  /** Whether an API key is stored, not what it is. */
+  hasKey: z.boolean(),
+  /** True when the account has both a workspace and a key, so it can be used. */
   ready: z.boolean(),
 });
+
+/** The editable half of an account. `id` is null when creating one. */
+const accountDraftSchema = z
+  .object({
+    id: z.string().min(1).nullable(),
+    label: z.string().trim().min(1).max(64),
+    serverUrl: z.string().trim().max(300),
+    workspace: z.string().trim().max(120),
+    webUrl: z.string().trim().max(300),
+    defaultProject: z.string().trim().max(120),
+    /** Null leaves a stored key alone; "" clears it. */
+    apiKey: z.string().max(500).nullable(),
+  })
+  .strict();
 
 export type BoardWorkItem = z.infer<typeof workItemSchema>;
 export type BoardComment = z.infer<typeof commentSchema>;
@@ -133,17 +121,30 @@ export type BoardLabel = z.infer<typeof namedSchema>;
 export type BoardMember = z.infer<typeof memberSchema>;
 export type BoardProject = z.infer<typeof projectSchema>;
 export type BoardAccount = z.infer<typeof accountInfoSchema>;
+export type AccountDraft = z.infer<typeof accountDraftSchema>;
 
 const accountInput = z.object({ accountId: z.string().min(1) });
 
 export const rpcContract = defineRpcContract({
-  config_read: {
+  accounts_list: {
     input: z.null(),
     output: z.object({
       accounts: z.array(accountInfoSchema),
-      /** The accounts setting could not be parsed; the message says why. */
-      error: z.string().nullable(),
+      /** How many more accounts fit; the key-slot pool is fixed. */
+      remainingSlots: z.number(),
     }),
+  },
+  account_save: {
+    input: accountDraftSchema,
+    output: z.object({ account: accountInfoSchema }),
+  },
+  account_remove: {
+    input: accountInput.strict(),
+    output: z.object({ removed: z.boolean() }),
+  },
+  account_test: {
+    input: accountInput.strict(),
+    output: z.object({ ok: z.boolean(), message: z.string() }),
   },
   projects_list: {
     input: accountInput.strict(),
@@ -217,51 +218,14 @@ interface Lookups {
 }
 
 export default async function plugin(bb: BbPluginApi) {
-  // Read the account list first: its ids decide which key settings exist.
-  const accountsSetting = bb.settings.define({
-    accounts: {
-      type: "string",
-      label: "Accounts",
-      description:
-        'JSON array of Plane connections: {"id","label","serverUrl","workspace","webUrl","defaultProject"}. Reload the plugin after adding one, so its API key field appears.',
-      experimental_multiline: true,
-      experimental_schema: z.string().refine((value) => {
-        try {
-          parseAccounts(value);
-          return true;
-        } catch {
-          return false;
-        }
-      }, "Accounts must be a JSON array of connections"),
-      default: JSON.stringify(
-        [
-          {
-            id: DEFAULT_ACCOUNT_ID,
-            label: "Plane",
-            serverUrl: "https://api.plane.so",
-            workspace: "",
-            webUrl: "",
-            defaultProject: "",
-          },
-        ],
-        null,
-        2,
-      ),
-    },
-  });
+  async function readAccounts(): Promise<StoredAccount[]> {
+    return (await bb.storage.kv.get<StoredAccount[]>(ACCOUNTS_KEY)) ?? [];
+  }
+  async function writeAccounts(accounts: StoredAccount[]): Promise<void> {
+    await bb.storage.kv.set(ACCOUNTS_KEY, accounts);
+  }
 
-  // Fields from the single-account version. Read once to seed `accounts`, then
-  // left empty; they will be removed in a later version.
-  const legacySetting = bb.settings.define({
-    workspace: { type: "string", label: "Workspace slug (moved to Accounts)", default: "" },
-    serverUrl: { type: "string", label: "Server URL (moved to Accounts)", default: "" },
-    webUrl: { type: "string", label: "Web UI URL (moved to Accounts)", default: "" },
-    defaultProject: {
-      type: "string",
-      label: "Default project (moved to Accounts)",
-      default: "",
-    },
-  });
+  const stored = await readAccounts();
 
   const generalSetting = bb.settings.define({
     maxItems: {
@@ -272,49 +236,62 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
-  /** The accounts as stored, or the parse error to report to the board. */
-  async function readAccounts(): Promise<{ accounts: Account[]; error: string | null }> {
-    const { accounts } = await accountsSetting.get();
-    try {
-      return { accounts: parseAccounts(accounts), error: null };
-    } catch (cause) {
-      const detail = cause instanceof Error ? cause.message : String(cause);
-      return { accounts: [], error: `The Accounts setting is not valid: ${detail}` };
-    }
-  }
-
-  // One-time migration off the single-account fields. The default account keeps
-  // the `apiKey` settings name, so a configured key survives untouched.
-  const legacy = await legacySetting.get();
-  if (legacy.workspace !== "" || legacy.serverUrl !== "") {
-    const { accounts } = await readAccounts();
-    const target = accounts.find((account) => account.id === DEFAULT_ACCOUNT_ID);
-    if (target !== undefined && target.workspace === "") {
-      target.workspace = legacy.workspace;
-      if (legacy.serverUrl !== "") target.serverUrl = legacy.serverUrl;
-      target.webUrl = legacy.webUrl;
-      target.defaultProject = legacy.defaultProject;
-      await accountsSetting.experimental_set({ accounts: JSON.stringify(accounts, null, 2) });
-      bb.log.info(`migrated the single-account settings into account '${DEFAULT_ACCOUNT_ID}'`);
-    }
-    await legacySetting.experimental_set({
-      workspace: null,
-      serverUrl: null,
-      webUrl: null,
-      defaultProject: null,
-    });
-  }
-
-  // Descriptors are fixed for the life of a load, so the key fields come from
-  // the account ids stored right now. `default` is always present, which is why
-  // an install with no accounts still has somewhere to put a key.
-  const { accounts: definedAccounts } = await readAccounts();
-  const keyDescriptors: Record<string, { type: "string"; label: string; secret: true }> = {};
-  for (const id of new Set([DEFAULT_ACCOUNT_ID, ...definedAccounts.map((a) => a.id)])) {
-    const label = definedAccounts.find((account) => account.id === id)?.label ?? id;
-    keyDescriptors[keySettingName(id)] = {
+  // Fields from the versions before the Accounts panel. Read once to seed kv,
+  // then left empty; they will be removed in a later version.
+  const legacySetting = bb.settings.define({
+    accounts: {
       type: "string",
-      label: `API key — ${label}`,
+      label: "Accounts JSON (moved to the Accounts panel)",
+      experimental_multiline: true,
+      default: "",
+    },
+  });
+
+  if (stored.length === 0) {
+    const raw = (await legacySetting.get()).accounts.trim();
+    if (raw !== "" && raw !== "[]") {
+      try {
+        const parsed: unknown = JSON.parse(raw);
+        const migrated: StoredAccount[] = (Array.isArray(parsed) ? parsed : [])
+          .slice(0, MAX_ACCOUNTS)
+          .map((entry, index) => {
+            const row = entry as Record<string, unknown>;
+            const id = typeof row.id === "string" ? row.id : `account_${index + 1}`;
+            return {
+              id,
+              label: typeof row.label === "string" ? row.label : id,
+              serverUrl: typeof row.serverUrl === "string" ? row.serverUrl : "",
+              workspace: typeof row.workspace === "string" ? row.workspace : "",
+              webUrl: typeof row.webUrl === "string" ? row.webUrl : "",
+              defaultProject:
+                typeof row.defaultProject === "string" ? row.defaultProject : "",
+              // The old scheme named the first account's key `apiKey` too, so
+              // the migrated account keeps the key already stored for it.
+              keySetting: KEY_SLOTS[index] ?? KEY_SLOTS[0],
+            };
+          });
+        if (migrated.length > 0) {
+          await writeAccounts(migrated);
+          stored.push(...migrated);
+          bb.log.info(`migrated ${migrated.length} account(s) into the Accounts panel`);
+        }
+      } catch (cause) {
+        bb.log.warn(`could not migrate the Accounts JSON setting: ${String(cause)}`);
+      }
+      await legacySetting.experimental_set({ accounts: null });
+    }
+  }
+
+  // The key slots are declared up front so the Accounts panel can store a new
+  // account's key without a reload. Each is labelled with whichever account
+  // holds it, which is why this runs after the migration above.
+  const keyDescriptors: Record<string, { type: "string"; label: string; secret: true }> = {};
+  for (const slot of KEY_SLOTS) {
+    const holder = stored.find((account) => account.keySetting === slot);
+    keyDescriptors[slot] = {
+      type: "string",
+      label:
+        holder === undefined ? `API key — unused slot (${slot})` : `API key — ${holder.label}`,
       secret: true,
     };
   }
@@ -335,22 +312,20 @@ export default async function plugin(bb: BbPluginApi) {
     lookupCache.clear();
     publishConfigChanged();
   };
-  accountsSetting.onChange(onSettingsChanged);
   generalSetting.onChange(onSettingsChanged);
   keySettings.onChange(onSettingsChanged);
 
-  /**
-   * The connection for one account, or null when it has no key or no workspace.
-   * Settings are re-read per call so an edit takes effect without a reload.
-   */
-  async function readConfig(accountId: string): Promise<PlaneConfig | null> {
-    const { accounts } = await readAccounts();
-    const account = accounts.find((candidate) => candidate.id === accountId);
-    if (account === undefined) return null;
-    const keyName = keySettingName(account.id);
-    if (!(keyName in keyDescriptors)) return null;
+  async function readKey(account: StoredAccount): Promise<string> {
+    if (!KEY_SLOTS.includes(account.keySetting)) return "";
     const keys = await keySettings.get();
-    const apiKey = String(keys[keyName] ?? "").trim();
+    return String(keys[account.keySetting] ?? "").trim();
+  }
+
+  /** The connection for one account, or null when it has no key or workspace. */
+  async function readConfig(accountId: string): Promise<PlaneConfig | null> {
+    const account = (await readAccounts()).find((candidate) => candidate.id === accountId);
+    if (account === undefined) return null;
+    const apiKey = await readKey(account);
     if (apiKey === "" || account.workspace === "") return null;
     const { rootUrl, webUrl } = resolveUrls(account.serverUrl, account.webUrl);
     return { apiKey, workspace: account.workspace, rootUrl, webUrl };
@@ -360,10 +335,24 @@ export default async function plugin(bb: BbPluginApi) {
     const config = await readConfig(accountId);
     if (config === null) {
       throw new Error(
-        `Account '${accountId}' is not ready. Give it a workspace slug and an API key in Extensions -> Plugins -> Plane Board.`,
+        `Account '${accountId}' is not ready. Give it a workspace slug and an API key in the Accounts panel.`,
       );
     }
     return config;
+  }
+
+  async function toInfo(account: StoredAccount): Promise<BoardAccount> {
+    const apiKey = await readKey(account);
+    return {
+      id: account.id,
+      label: account.label,
+      serverUrl: account.serverUrl,
+      workspace: account.workspace,
+      webUrl: account.webUrl,
+      defaultProject: account.defaultProject,
+      hasKey: apiKey !== "",
+      ready: apiKey !== "" && account.workspace !== "",
+    };
   }
 
   async function getLookups(config: PlaneConfig, projectId: string): Promise<Lookups> {
@@ -391,33 +380,111 @@ export default async function plugin(bb: BbPluginApi) {
     item: Omit<BoardWorkItem, "url">,
   ): BoardWorkItem => ({ ...item, url: workItemUrl(config, projectId, item.id) });
 
-  const readyAccounts = await Promise.all(
-    definedAccounts.map(async (account) => (await readConfig(account.id)) !== null),
+  const anyReady = await Promise.all(
+    stored.map(async (account) => (await readConfig(account.id)) !== null),
   );
-  if (!readyAccounts.includes(true)) {
+  if (!anyReady.includes(true)) {
     bb.status.needsConfiguration(
-      "Add a Plane workspace slug and API key in Extensions -> Plugins -> Plane Board.",
+      "Add a Plane connection in the Accounts panel on this plugin's settings page.",
     );
   }
 
+  /** Create or update one account, and store its key when the draft carries one. */
+  async function saveAccount(draft: AccountDraft): Promise<BoardAccount> {
+    const accounts = await readAccounts();
+    const existing =
+      draft.id === null ? undefined : accounts.find((candidate) => candidate.id === draft.id);
+
+    if (draft.id !== null && existing === undefined) {
+      throw new Error(`No account '${draft.id}'.`);
+    }
+
+    let account: StoredAccount;
+    if (existing === undefined) {
+      if (accounts.length >= MAX_ACCOUNTS) {
+        throw new Error(
+          `This plugin holds at most ${MAX_ACCOUNTS} accounts. Remove one before adding another.`,
+        );
+      }
+      const slot = freeKeySlot(accounts);
+      if (slot === null) throw new Error("No API key slot is free.");
+      account = {
+        id: uniqueId(
+          draft.label,
+          accounts.map((candidate) => candidate.id),
+        ),
+        label: draft.label,
+        serverUrl: draft.serverUrl,
+        workspace: draft.workspace,
+        webUrl: draft.webUrl,
+        defaultProject: draft.defaultProject,
+        keySetting: slot,
+      };
+      accounts.push(account);
+    } else {
+      // The id is stable once created: board URLs point at it.
+      existing.label = draft.label;
+      existing.serverUrl = draft.serverUrl;
+      existing.workspace = draft.workspace;
+      existing.webUrl = draft.webUrl;
+      existing.defaultProject = draft.defaultProject;
+      account = existing;
+    }
+
+    // A null key means "leave whatever is stored"; "" clears it.
+    if (draft.apiKey !== null) {
+      await keySettings.experimental_set({
+        [account.keySetting]: draft.apiKey.trim() === "" ? null : draft.apiKey.trim(),
+      });
+    }
+
+    await writeAccounts(accounts);
+    lookupCache.clear();
+    publishConfigChanged();
+    return toInfo(account);
+  }
+
+  /** Remove one account and release the key slot it held. */
+  async function removeAccount(accountId: string): Promise<boolean> {
+    const accounts = await readAccounts();
+    const target = accounts.find((candidate) => candidate.id === accountId);
+    if (target === undefined) return false;
+    // Free the key slot too, or it stays claimed and unreachable.
+    await keySettings.experimental_set({ [target.keySetting]: null });
+    await writeAccounts(accounts.filter((candidate) => candidate.id !== accountId));
+    lookupCache.clear();
+    publishConfigChanged();
+    return true;
+  }
+
+  /** Ask Plane whether this account's key and workspace actually work. */
+  async function testAccount(accountId: string): Promise<{ ok: boolean; message: string }> {
+    try {
+      const config = await requireConfig(accountId);
+      const projects = await listProjects(config);
+      return {
+        ok: true,
+        message: `Reached ${config.workspace} at ${config.rootUrl} — ${projects.length} project${projects.length === 1 ? "" : "s"}.`,
+      };
+    } catch (cause) {
+      return { ok: false, message: cause instanceof Error ? cause.message : String(cause) };
+    }
+  }
+
   bb.rpc.register(rpcContract, {
-    config_read: async () => {
-      const { accounts, error } = await readAccounts();
-      const infos = await Promise.all(
-        accounts.map(async (account) => {
-          const { rootUrl } = resolveUrls(account.serverUrl, account.webUrl);
-          return {
-            id: account.id,
-            label: account.label,
-            workspace: account.workspace,
-            rootUrl,
-            defaultProject: account.defaultProject,
-            ready: (await readConfig(account.id)) !== null,
-          };
-        }),
-      );
-      return { accounts: infos, error };
+    accounts_list: async () => {
+      const accounts = await readAccounts();
+      return {
+        accounts: await Promise.all(accounts.map(toInfo)),
+        remainingSlots: Math.max(0, MAX_ACCOUNTS - accounts.length),
+      };
     },
+
+    account_save: async (draft) => ({ account: await saveAccount(draft) }),
+
+    account_remove: async ({ accountId }) => ({ removed: await removeAccount(accountId) }),
+
+    account_test: ({ accountId }) => testAccount(accountId),
 
     projects_list: async ({ accountId }) => {
       const config = await requireConfig(accountId);
@@ -484,7 +551,8 @@ export default async function plugin(bb: BbPluginApi) {
     "  bb plane-board check [--account <id>]     Verify a connection's key and workspace",
     "  bb plane-board projects [--account <id>]  List an account's projects",
     "",
-    "--account defaults to the first ready connection. Add --json for raw output.",
+    "Accounts are added and edited in the Accounts panel on the plugin's settings",
+    "page. --account defaults to the first ready connection; --json for raw output.",
   ].join("\n");
 
   bb.cli.register({
@@ -519,10 +587,13 @@ export default async function plugin(bb: BbPluginApi) {
       const [command] = rest;
 
       /** The named account, or the first one that can actually be used. */
-      async function pickAccount(): Promise<Account> {
-        const { accounts, error } = await readAccounts();
-        if (error !== null) throw new Error(error);
-        if (accounts.length === 0) throw new Error("No accounts are configured.");
+      async function pickAccount(): Promise<StoredAccount> {
+        const accounts = await readAccounts();
+        if (accounts.length === 0) {
+          throw new Error(
+            "No accounts yet. Add one in the Accounts panel on this plugin's settings page.",
+          );
+        }
         if (requested !== null) {
           const named = accounts.find((account) => account.id === requested);
           if (named === undefined) {
@@ -535,9 +606,7 @@ export default async function plugin(bb: BbPluginApi) {
         for (const account of accounts) {
           if ((await readConfig(account.id)) !== null) return account;
         }
-        throw new Error(
-          "No account has both a workspace slug and an API key yet. Run `bb plane-board accounts`.",
-        );
+        throw new Error("No account has both a workspace slug and an API key yet.");
       }
 
       try {
@@ -548,27 +617,18 @@ export default async function plugin(bb: BbPluginApi) {
             return { exitCode: 0, stdout: usage };
 
           case "accounts": {
-            const { accounts, error } = await readAccounts();
-            if (error !== null) return { exitCode: 1, stderr: error };
-            const rows = await Promise.all(
-              accounts.map(async (account) => ({
-                id: account.id,
-                label: account.label,
-                workspace: account.workspace,
-                serverUrl: resolveUrls(account.serverUrl, account.webUrl).rootUrl,
-                ready: (await readConfig(account.id)) !== null,
-              })),
-            );
+            const accounts = await readAccounts();
+            const rows = await Promise.all(accounts.map(toInfo));
             if (json) return { exitCode: 0, stdout: JSON.stringify(rows) };
             return {
               exitCode: 0,
               stdout:
                 rows.length === 0
-                  ? "No accounts are configured."
+                  ? "No accounts yet. Add one in the Accounts panel on this plugin's settings page."
                   : rows
                       .map(
                         (row) =>
-                          `${row.ready ? "✓" : "✗"} ${row.id}\t${row.label}\t${row.workspace === "" ? "(no workspace)" : row.workspace}\t${row.serverUrl}`,
+                          `${row.ready ? "✓" : "✗"} ${row.id}\t${row.label}\t${row.workspace === "" ? "(no workspace)" : row.workspace}\t${resolveUrls(row.serverUrl, row.webUrl).rootUrl}`,
                       )
                       .join("\n"),
             };
